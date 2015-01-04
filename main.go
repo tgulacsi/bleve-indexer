@@ -16,8 +16,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -116,12 +117,14 @@ func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 
 	ct := r.Header.Get("Content-Type")
 	defer r.Body.Close()
+	var id string
 	bdy := io.ReadCloser(r.Body)
 	if ct == "multipart/form-data" || ct == "application/x-www-form-encoded" {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, fmt.Sprintf("cannot parse request: %v", err), http.StatusBadRequest)
 			return
 		}
+		id = r.Form.Get("id")
 		if r.MultipartForm == nil || r.MultipartForm.File == nil {
 			http.Error(w, "no file given!", http.StatusBadRequest)
 			return
@@ -136,8 +139,9 @@ func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 			defer bdy.Close()
 			break
 		}
+	} else {
+		id = r.URL.Query().Get("id")
 	}
-	id := r.Form.Get("id")
 	if id == "" {
 		http.Error(w, "id is required!", http.StatusBadRequest)
 		return
@@ -148,15 +152,18 @@ func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("analyze: %v", err), http.StatusInternalServerError)
 		return
 	}
+	Log.Debug("analyze", "meta", meta, "text", text)
 	if err = c.store(id, meta, text); err != nil {
 		http.Error(w, fmt.Sprintf("store: %v", err), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(&document{ID: id, metadata: meta})
 }
 
 type document struct {
-	ID string
+	ID string `json:"id"`
 	metadata
 	text string
 }
@@ -215,9 +222,11 @@ func (c config) analyze(r io.Reader) (metadata, string, error) {
 }
 
 type metadata struct {
-	Author, ContentType, Title string
-	Data                       map[string]string
-	Created                    time.Time
+	Author      string            `json:"author"`
+	ContentType string            `json:"content-type"`
+	Title       string            `json:"title"`
+	Data        map[string]string `json:"data"`
+	Created     time.Time         `json:"created"`
 }
 
 /*
@@ -250,30 +259,39 @@ type metadata struct {
 */
 func readMeta(r io.Reader) (metadata, error) {
 	var meta metadata
-	records, err := csv.NewReader(r).ReadAll()
-	if err != nil {
-		return meta, err
-	}
-	for _, rec := range records {
-		switch rec[0] {
+	scanner := bufio.NewScanner(r)
+	scanner.Split(bufio.ScanLines)
+	for scanner.Scan() {
+		line := bytes.TrimLeft(bytes.TrimRight(scanner.Bytes(), "\"\n"), `"`)
+		i := bytes.Index(line, []byte(`","`))
+		if i < 0 {
+			Log.Warn("no field separator", "line", scanner.Text())
+			continue
+		}
+		key := string(line[:i])
+		value := string(bytes.Replace(line[i+3:], []byte{'"'}, []byte{}, -1))
+		Log.Debug("scan", "key", key, "value", value)
+
+		switch key {
 		case "Content-Type":
-			meta.ContentType = rec[1]
+			meta.ContentType = value
 		case "Author":
-			meta.Author = rec[1]
+			meta.Author = value
 		case "Creation-Date":
-			if meta.Created, err = time.Parse(time.RFC3339, rec[1]); err != nil {
-				Log.Warn("parse Creation-Date", "text", rec[1], "error", err)
+			var err error
+			if meta.Created, err = time.Parse(time.RFC3339, value); err != nil {
+				Log.Warn("parse Creation-Date", "text", value, "error", err)
 			}
 		case "title":
-			meta.Title = rec[1]
+			meta.Title = value
 		default:
 			if meta.Data == nil {
-				meta.Data = make(map[string]string, len(records))
+				meta.Data = make(map[string]string, 32)
 			}
-			meta.Data[rec[0]] = rec[1]
+			meta.Data[key] = value
 		}
 	}
-	return meta, nil
+	return meta, scanner.Err()
 }
 
 // ensureTikaServer checks whether the Tika server runs, and starts it if not.
