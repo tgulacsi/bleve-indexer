@@ -32,20 +32,29 @@ import (
 	"time"
 
 	"github.com/blevesearch/bleve"
+	"github.com/tgulacsi/go/loghlp"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var Log = log15.New()
 
+var indexMapping *bleve.IndexMapping
+
 func main() {
 	Log.SetHandler(log15.StderrHandler)
+	bleve.SetLog(loghlp.AsStdLog(Log, log15.LvlDebug))
 
+	flagVerbose := flag.Bool("v", false, "verbose logging")
 	flagAddr := flag.String("http", ":9997", "host:port to listen on")
 	flagJavaBin := flag.String("java", "/usr/bin/java", "absolute path of the java binary")
 	flagTikaJar := flag.String("tika-jar", "/usr/local/share/java/tika-server.jar", "absolute path of the Tika jar")
 	flagTikaPort := flag.Int("tika-port", 9998, "Tika port")
 	flagIndex := flag.String("index", "/data/index.bleve", "absolute path of the Bleve index file")
 	flag.Parse()
+
+	if !*flagVerbose {
+		Log.SetHandler(log15.LvlFilterHandler(log15.LvlInfo, log15.StderrHandler))
+	}
 
 	conf := config{java: *flagJavaBin, jar: *flagTikaJar, tikaPort: *flagTikaPort,
 		httpClient: http.DefaultClient,
@@ -54,12 +63,13 @@ func main() {
 	if err == nil { //exist
 		conf.index, err = bleve.Open(*flagIndex)
 	} else {
-		conf.index, err = bleve.New(*flagIndex, bleve.NewIndexMapping())
+		conf.index, err = bleve.New(*flagIndex, indexMapping)
 	}
 	if err != nil {
 		Log.Crit("Open bleve index", "path", *flagIndex, "error", err)
 		os.Exit(2)
 	}
+	defer conf.index.Close()
 
 	Log.Info("Trying Tika server")
 	if err := conf.ensureTikaServer(); err != nil {
@@ -108,6 +118,15 @@ func (c config) getHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c config) searchHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	Log.Info("search", "q", q)
+	qry := bleve.NewQueryStringQuery(q)
+	results, err := c.index.Search(bleve.NewSearchRequest(qry))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Search (%q): %v", q, err), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "Results: %+v\n", results)
 }
 func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 	if err := c.ensureTikaServer(); err != nil {
@@ -162,14 +181,10 @@ func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(&document{ID: id, metadata: meta})
 }
 
-type document struct {
-	ID string `json:"id"`
-	metadata
-	text string
-}
-
 func (c config) store(ID string, meta metadata, text string) error {
-	return c.index.Index(ID, document{ID: ID, metadata: meta, text: text})
+	doc := document{ID: ID, metadata: meta, Text: text}
+	Log.Debug("Index", "document", doc)
+	return c.index.Index(ID, doc)
 }
 
 func (c config) analyze(r io.Reader) (metadata, string, error) {
@@ -219,6 +234,48 @@ func (c config) analyze(r io.Reader) (metadata, string, error) {
 	}
 	text = string(b)
 	return meta, text, err
+}
+
+var _ bleve.Classifier = document{}
+
+type document struct {
+	ID string `json:"id"`
+	metadata
+	Text string `json:"text"`
+}
+
+func (d document) Type() string {
+	//return d.metadata.ContentType
+	return "tika"
+}
+
+func init() {
+	authorFieldMapping := bleve.NewTextFieldMapping()
+	//authorFieldMapping.Analyzer = "hu"
+	ctFieldMapping := bleve.NewTextFieldMapping()
+	titleFieldMapping := bleve.NewTextFieldMapping()
+	createdFieldMapping := bleve.NewDateTimeFieldMapping()
+	createdFieldMapping.Store = false
+	dataFieldMapping := bleve.NewDocumentDisabledMapping()
+
+	metaMapping := bleve.NewDocumentMapping()
+	metaMapping.AddFieldMappingsAt("Author", authorFieldMapping)
+	metaMapping.AddFieldMappingsAt("ContentType", ctFieldMapping)
+	metaMapping.AddFieldMappingsAt("Title", titleFieldMapping)
+	metaMapping.AddFieldMappingsAt("Created", createdFieldMapping)
+	metaMapping.AddSubDocumentMapping("Data", dataFieldMapping)
+
+	idFieldMapping := bleve.NewTextFieldMapping()
+	textFieldMapping := bleve.NewTextFieldMapping()
+	//textFieldMapping.Analyzer = "hu"
+
+	tikaMapping := bleve.NewDocumentMapping()
+	tikaMapping.AddFieldMappingsAt("ID", idFieldMapping)
+	tikaMapping.AddSubDocumentMapping("metadata", metaMapping)
+	tikaMapping.AddFieldMappingsAt("Text", textFieldMapping)
+
+	indexMapping = bleve.NewIndexMapping()
+	indexMapping.AddDocumentMapping("tika", tikaMapping)
 }
 
 type metadata struct {
