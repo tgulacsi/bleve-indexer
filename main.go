@@ -16,8 +16,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/blevesearch/bleve"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
@@ -41,25 +46,40 @@ func main() {
 	flagIndex := flag.String("index", "/data/index.bleve", "absolute path of the Bleve index file")
 	flag.Parse()
 
-	conf := config{index: *flagIndex, java: *flagJavaBin, jar: *flagTikaJar, tikaPort: *flagTikaPort}
-	http.HandleFunc("/", conf.rootHandler)
+	conf := config{java: *flagJavaBin, jar: *flagTikaJar, tikaPort: *flagTikaPort,
+		httpClient: http.DefaultClient,
+	}
+	_, err := os.Stat(*flagIndex)
+	if err == nil { //exist
+		conf.index, err = bleve.Open(*flagIndex)
+	} else {
+		conf.index, err = bleve.New(*flagIndex, bleve.NewIndexMapping())
+	}
+	if err != nil {
+		Log.Crit("Open bleve index", "path", *flagIndex, "error", err)
+		os.Exit(2)
+	}
 
 	Log.Info("Trying Tika server")
 	if err := conf.ensureTikaServer(); err != nil {
 		Log.Crit("Start Tika server", "error", err)
 		os.Exit(1)
 	}
+
 	Log.Info("Tika server started successfully.")
-	_ = conf.killTikaServer()
+	http.HandleFunc("/search", conf.searchHandler)
+	http.HandleFunc("/add", conf.addHandler)
+	http.HandleFunc("/", conf.rootHandler)
 
 	Log.Info("Listening on " + *flagAddr)
 	Log.Info("Running", "error", http.ListenAndServe(*flagAddr, nil))
 }
 
 type config struct {
-	index     string
-	java, jar string
-	tikaPort  int
+	index      bleve.Index
+	java, jar  string
+	tikaPort   int
+	httpClient *http.Client
 
 	tikaMu sync.Mutex
 	tika   *os.Process
@@ -84,6 +104,176 @@ func (c config) putHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (c config) getHandler(w http.ResponseWriter, r *http.Request) {
+}
+
+func (c config) searchHandler(w http.ResponseWriter, r *http.Request) {
+}
+func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
+	if err := c.ensureTikaServer(); err != nil {
+		http.Error(w, fmt.Sprintf("Start Tika server: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	ct := r.Header.Get("Content-Type")
+	defer r.Body.Close()
+	bdy := io.ReadCloser(r.Body)
+	if ct == "multipart/form-data" || ct == "application/x-www-form-encoded" {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, fmt.Sprintf("cannot parse request: %v", err), http.StatusBadRequest)
+			return
+		}
+		if r.MultipartForm == nil || r.MultipartForm.File == nil {
+			http.Error(w, "no file given!", http.StatusBadRequest)
+			return
+		}
+		for k := range r.MultipartForm.File {
+			var err error
+			bdy, _, err = r.FormFile(k)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("FormFile[%q]: %v", k, err), http.StatusBadRequest)
+				return
+			}
+			defer bdy.Close()
+			break
+		}
+	}
+	id := r.Form.Get("id")
+	if id == "" {
+		http.Error(w, "id is required!", http.StatusBadRequest)
+		return
+	}
+
+	meta, text, err := c.analyze(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("analyze: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if err = c.store(id, meta, text); err != nil {
+		http.Error(w, fmt.Sprintf("store: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+type document struct {
+	ID string
+	metadata
+	text string
+}
+
+func (c config) store(ID string, meta metadata, text string) error {
+	return c.index.Index(ID, document{ID: ID, metadata: meta, text: text})
+}
+
+func (c config) analyze(r io.Reader) (metadata, string, error) {
+	var (
+		meta metadata
+		text string
+		buf  bytes.Buffer
+	)
+
+	baseUrl := "http://localhost:" + strconv.Itoa(c.tikaPort)
+	// buffer data in memory
+	r2 := io.TeeReader(r, &buf)
+	// meta
+	req, err := http.NewRequest("PUT", baseUrl+"/meta", r2)
+	if err != nil {
+		return meta, text, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return meta, text, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return meta, text, err
+	}
+	meta, err = readMeta(resp.Body)
+
+	// buffer remaining data
+	if _, err = io.Copy(ioutil.Discard, r2); err != nil {
+		return meta, text, err
+	}
+
+	// get text
+	if req, err = http.NewRequest("PUT", baseUrl+"/tika", bytes.NewReader(buf.Bytes())); err != nil {
+		return meta, text, err
+	}
+	if resp, err = c.httpClient.Do(req); err != nil {
+		return meta, text, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return meta, text, err
+	}
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return meta, text, err
+	}
+	text = string(b)
+	return meta, text, err
+}
+
+type metadata struct {
+	Author, ContentType, Title string
+	Data                       map[string]string
+	Created                    time.Time
+}
+
+/*
+"cp:revision","2"
+"meta:last-author","altbac"
+"Last-Author","altbac"
+"meta:save-date","2013-05-03T07:46:00Z"
+"Author","altbac"
+"dcterms:created","2013-05-03T07:46:00Z"
+"date","2013-05-03T07:46:00Z"
+"extended-properties:Template","Normal"
+"creator","altbac"
+"Edit-Time","600000000"
+"Creation-Date","2013-05-03T07:46:00Z"
+"title","A BAGOLY TANODA NYÁRI TÁBORA"
+"meta:author","altbac"
+"dc:title","A BAGOLY TANODA NYÁRI TÁBORA"
+"Last-Save-Date","2013-05-03T07:46:00Z"
+"Revision-Number","2"
+"Last-Printed","1601-01-01T00:00:00Z"
+"meta:print-date","1601-01-01T00:00:00Z"
+"meta:creation-date","2013-05-03T07:46:00Z"
+"dcterms:modified","2013-05-03T07:46:00Z"
+"Template","Normal"
+"dc:creator","altbac"
+"Last-Modified","2013-05-03T07:46:00Z"
+"X-Parsed-By","org.apache.tika.parser.ParserDecorator$1","org.apache.tika.parser.microsoft.OfficeParser"
+"modified","2013-05-03T07:46:00Z"
+"Content-Type","application/msword"
+*/
+func readMeta(r io.Reader) (metadata, error) {
+	var meta metadata
+	records, err := csv.NewReader(r).ReadAll()
+	if err != nil {
+		return meta, err
+	}
+	for _, rec := range records {
+		switch rec[0] {
+		case "Content-Type":
+			meta.ContentType = rec[1]
+		case "Author":
+			meta.Author = rec[1]
+		case "Creation-Date":
+			if meta.Created, err = time.Parse(time.RFC3339, rec[1]); err != nil {
+				Log.Warn("parse Creation-Date", "text", rec[1], "error", err)
+			}
+		case "title":
+			meta.Title = rec[1]
+		default:
+			if meta.Data == nil {
+				meta.Data = make(map[string]string, len(records))
+			}
+			meta.Data[rec[0]] = rec[1]
+		}
+	}
+	return meta, nil
 }
 
 // ensureTikaServer checks whether the Tika server runs, and starts it if not.
