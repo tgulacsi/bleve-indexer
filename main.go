@@ -148,6 +148,7 @@ func (c config) addHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no file given!", http.StatusBadRequest)
 			return
 		}
+		defer r.MultipartForm.RemoveAll()
 		for k := range r.MultipartForm.File {
 			var err error
 			bdy, _, err = r.FormFile(k)
